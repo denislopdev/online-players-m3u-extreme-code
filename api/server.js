@@ -358,16 +358,21 @@ function registerM3uRoutes(basePath) {
 
         const contentType = response.headers["content-type"] || "";
         const pathname = streamUrl.pathname.toLowerCase();
+        const lowerUrl = streamUrlString.toLowerCase();
 
-        const isPlaylist =
+        const looksLikePlaylistUrl =
           contentType.indexOf("mpegurl") !== -1 ||
           contentType.indexOf("application/vnd.apple.mpegurl") !== -1 ||
           pathname.indexOf(".m3u8") !== -1 ||
           pathname.indexOf(".m3u") !== -1 ||
-          streamUrlString.toLowerCase().indexOf("m3u8") !== -1;
+          lowerUrl.indexOf("m3u8") !== -1 ||
+          lowerUrl.indexOf("mode=hls") !== -1;
 
-        if (isPlaylist) {
-          let data = "";
+        // Buffer a bit first so extensionless IPTV links that return M3U8 are rewritten.
+        let decided = false;
+
+        function sendAsPlaylist(initialText) {
+          let data = initialText || "";
 
           response.setEncoding("utf8");
 
@@ -381,39 +386,74 @@ function registerM3uRoutes(basePath) {
             res.setHeader("Access-Control-Allow-Origin", "*");
             res.send(rewriteHlsPlaylist(data, streamUrlString, req));
           });
+        }
 
+        function sendAsBinary(initialBuffer) {
+          res.statusCode = response.statusCode;
+
+          if (contentType) {
+            res.setHeader("Content-Type", contentType);
+          } else if (pathname.indexOf(".ts") !== -1) {
+            res.setHeader("Content-Type", "video/mp2t");
+          } else if (pathname.indexOf(".m4s") !== -1 || pathname.indexOf(".mp4") !== -1) {
+            res.setHeader("Content-Type", "video/mp4");
+          } else if (pathname.indexOf(".aac") !== -1) {
+            res.setHeader("Content-Type", "audio/aac");
+          } else {
+            res.setHeader("Content-Type", "application/octet-stream");
+          }
+
+          if (response.headers["content-length"] && !initialBuffer) {
+            res.setHeader("Content-Length", response.headers["content-length"]);
+          }
+
+          if (response.headers["content-range"]) {
+            res.setHeader("Content-Range", response.headers["content-range"]);
+          }
+
+          if (response.headers["accept-ranges"]) {
+            res.setHeader("Accept-Ranges", response.headers["accept-ranges"]);
+          }
+
+          res.setHeader("Access-Control-Allow-Origin", "*");
+
+          if (initialBuffer && initialBuffer.length) {
+            res.write(initialBuffer);
+          }
+
+          response.pipe(res);
+        }
+
+        if (looksLikePlaylistUrl) {
+          sendAsPlaylist("");
           return;
         }
 
-        res.statusCode = response.statusCode;
+        response.on("data", function onFirst(chunk) {
+          if (decided) {
+            return;
+          }
 
-        if (contentType) {
-          res.setHeader("Content-Type", contentType);
-        } else if (pathname.indexOf(".ts") !== -1) {
-          res.setHeader("Content-Type", "video/mp2t");
-        } else if (pathname.indexOf(".m4s") !== -1 || pathname.indexOf(".mp4") !== -1) {
-          res.setHeader("Content-Type", "video/mp4");
-        } else if (pathname.indexOf(".aac") !== -1) {
-          res.setHeader("Content-Type", "audio/aac");
-        } else {
-          res.setHeader("Content-Type", "application/octet-stream");
-        }
+          decided = true;
+          response.removeListener("data", onFirst);
 
-        if (response.headers["content-length"]) {
-          res.setHeader("Content-Length", response.headers["content-length"]);
-        }
+          const preview = Buffer.isBuffer(chunk)
+            ? chunk.toString("utf8", 0, Math.min(chunk.length, 64))
+            : String(chunk).slice(0, 64);
 
-        if (response.headers["content-range"]) {
-          res.setHeader("Content-Range", response.headers["content-range"]);
-        }
+          if (preview.indexOf("#EXTM3U") === 0 || preview.indexOf("#EXT-X-") === 0) {
+            sendAsPlaylist(preview.length === chunk.length ? preview : Buffer.from(chunk).toString("utf8"));
+            return;
+          }
 
-        if (response.headers["accept-ranges"]) {
-          res.setHeader("Accept-Ranges", response.headers["accept-ranges"]);
-        }
+          sendAsBinary(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
 
-        res.setHeader("Access-Control-Allow-Origin", "*");
-
-        response.pipe(res);
+        response.on("end", function () {
+          if (!decided && !res.headersSent) {
+            res.status(400).send("Empty stream response");
+          }
+        });
       }
     );
 

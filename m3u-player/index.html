@@ -216,16 +216,27 @@
       return `${API_BASE}/api/stream?url=${encodeURIComponent(url)}`;
     }
 
-    function looksLikeHls(url) {
-      try {
-        const pathname = new URL(url).pathname.toLowerCase();
-        return pathname.endsWith(".m3u8") || pathname.endsWith(".m3u");
-      } catch (error) {
-        return /\.m3u8?($|\?)/i.test(String(url || ""));
+    function isProgressiveMedia(url) {
+      return /\.(mp4|mkv|avi|webm|mov|flv)($|\?)/i.test(String(url || ""));
+    }
+
+    function shouldTryHls(url) {
+      if (isProgressiveMedia(url)) {
+        return false;
       }
+
+      const lower = String(url || "").toLowerCase();
+
+      if (/\.m3u8?($|\?)/i.test(lower) || lower.includes("m3u8") || lower.includes("mode=hls")) {
+        return true;
+      }
+
+      // Most IPTV live links omit the .m3u8 extension — try HLS first.
+      return true;
     }
 
     let playbackTimer = null;
+    let networkRetries = 0;
 
     function clearPlaybackTimer() {
       if (playbackTimer) {
@@ -234,15 +245,20 @@
       }
     }
 
+    function showPlaybackError(message) {
+      clearPlaybackTimer();
+      hideLoading();
+      nowTitle.textContent = message || "Playback error. Please try another channel.";
+    }
+
     function startPlaybackTimer() {
       clearPlaybackTimer();
       playbackTimer = setTimeout(function () {
-        hideLoading();
         if (hls) {
           hls.destroy();
           hls = null;
         }
-        setStatus("Playback timed out. Please try another channel.", "error");
+        showPlaybackError("Playback timed out. Please try another channel.");
       }, 60000);
     }
 
@@ -324,9 +340,7 @@
       });
     }
 
-    function playDirectStream(source) {
-      video.src = source;
-
+    function playDirectStream(source, allowFallbackToHls) {
       video.onplaying = function () {
         clearPlaybackTimer();
         hideLoading();
@@ -338,12 +352,78 @@
       };
 
       video.onerror = function () {
-        clearPlaybackTimer();
-        hideLoading();
-        setStatus("Playback error. Please try another channel.", "error");
+        if (allowFallbackToHls && window.Hls && Hls.isSupported()) {
+          playWithHls(source, false);
+          return;
+        }
+
+        showPlaybackError("Playback error. Please try another channel.");
       };
 
+      video.src = source;
       video.play().catch(function () {});
+    }
+
+    function playWithHls(source, allowFallbackDirect) {
+      networkRetries = 0;
+
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+
+      hls = new Hls({
+        enableWorker: false,
+        lowLatencyMode: false,
+        backBufferLength: 60,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        manifestLoadingTimeOut: 45000,
+        levelLoadingTimeOut: 45000,
+        fragLoadingTimeOut: 60000,
+        xhrSetup: function (xhr) {
+          xhr.withCredentials = false;
+        }
+      });
+
+      hls.loadSource(source);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, function () {
+        video.play().catch(function () {});
+      });
+
+      hls.on(Hls.Events.FRAG_BUFFERED, function () {
+        clearPlaybackTimer();
+        hideLoading();
+      });
+
+      hls.on(Hls.Events.ERROR, function (_, data) {
+        if (!data.fatal) {
+          return;
+        }
+
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 2) {
+          networkRetries += 1;
+          hls.startLoad();
+          return;
+        }
+
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
+          return;
+        }
+
+        hls.destroy();
+        hls = null;
+
+        if (allowFallbackDirect) {
+          playDirectStream(source, false);
+          return;
+        }
+
+        showPlaybackError("Playback error. Please try another channel.");
+      });
     }
 
     function playChannel(url, name) {
@@ -361,67 +441,21 @@
 
       video.pause();
       video.removeAttribute("src");
+      video.onerror = null;
       video.load();
 
       const source = proxiedUrl(url);
-      const isHls = looksLikeHls(url);
+      const preferHls = shouldTryHls(url);
+      const hlsJsReady = window.Hls && Hls.isSupported();
+      // Prefer HLS.js in Chrome/Edge/Firefox. Native HLS only when HLS.js is unavailable (Safari).
+      const useNativeHls = preferHls && !hlsJsReady && !!video.canPlayType("application/vnd.apple.mpegurl");
 
-      if (isHls && video.canPlayType("application/vnd.apple.mpegurl")) {
-        playDirectStream(source);
-        renderChannels();
-        return;
-      }
-
-      if (isHls && window.Hls && Hls.isSupported()) {
-        hls = new Hls({
-          enableWorker: false,
-          lowLatencyMode: false,
-          backBufferLength: 60,
-          maxBufferLength: 30,
-          maxMaxBufferLength: 60,
-          manifestLoadingTimeOut: 45000,
-          levelLoadingTimeOut: 45000,
-          fragLoadingTimeOut: 60000,
-          xhrSetup: function (xhr) {
-            xhr.withCredentials = false;
-          }
-        });
-
-        hls.loadSource(source);
-        hls.attachMedia(video);
-
-        hls.on(Hls.Events.MANIFEST_PARSED, function () {
-          video.play().catch(function () {});
-        });
-
-        hls.on(Hls.Events.FRAG_BUFFERED, function () {
-          clearPlaybackTimer();
-          hideLoading();
-        });
-
-        hls.on(Hls.Events.ERROR, function (_, data) {
-          if (!data.fatal) {
-            return;
-          }
-
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            hls.startLoad();
-            return;
-          }
-
-          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-            hls.recoverMediaError();
-            return;
-          }
-
-          clearPlaybackTimer();
-          hideLoading();
-          hls.destroy();
-          hls = null;
-          setStatus("Playback error. Please try another channel.", "error");
-        });
+      if (preferHls && hlsJsReady) {
+        playWithHls(source, true);
+      } else if (useNativeHls) {
+        playDirectStream(source, false);
       } else {
-        playDirectStream(source);
+        playDirectStream(source, preferHls);
       }
 
       renderChannels();
